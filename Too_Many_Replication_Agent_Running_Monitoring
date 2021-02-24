@@ -1,0 +1,108 @@
+USE [msdb]
+GO
+
+/****** Object:  StoredProcedure [dbo].[USP_REPORT_TOO_MANY_DIST_AGENTS_RUNNING]    Script Date: 31-01-2020 15:43:29 ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+--#################################################################################--
+/*
+--PROCEDURE NAME - USP_REPORT_TOO_MANY_DIST_AGENTS_RUNNING
+AUTHOR - RAKESH SHARMA
+DESCRIPTION   -- REPORT OUT WHEN TOO MANY DISTRIBUTION JOBS ARE RUNNING AND CONSUMING TOO MUCH CPU
+CREATION DATE -- 12-01-2020
+STATUS - YET TO BE TESTED AGAINST THE ISSUE
+PENDING - MAIL NOTIICATION NEED TO BE ADDED BUT MAIL CONFIGURATION IS PENDING
+*/
+CREATE PROCEDURE [dbo].[USP_REPORT_TOO_MANY_DIST_AGENTS_RUNNING]
+AS
+SET NOCOUNT ON
+BEGIN
+
+		--Getting the list of running Agents--	
+			IF OBJECT_ID('tempdb.dbo.#RunningJobs') IS NOT NULL
+				  DROP TABLE #RunningJobs
+			CREATE TABLE #RunningJobs (  
+			Job_ID UNIQUEIDENTIFIER,  
+			Last_Run_Date INT,  
+			Last_Run_Time INT,  
+			Next_Run_Date INT,  
+			Next_Run_Time INT,  
+			Next_Run_Schedule_ID INT,  
+			Requested_To_Run INT,  
+			Request_Source INT,  
+			Request_Source_ID VARCHAR(100),  
+			Running INT,  
+			Current_Step INT,  
+			Current_Retry_Attempt INT,  
+			State INT )    
+     		INSERT INTO #RunningJobs EXEC master.dbo.xp_sqlagent_enum_jobs 1,garbage  
+ 			
+			
+			SELECT    
+			  SJ.name AS [AGENT_NAME],
+			  'RUNNING' AS 'STATUS',
+			  CASE WHEN next_run_date=0 THEN '[NOT SCHEDULED\CONTINOUS]' ELSE
+			   CONVERT(VARCHAR,DATEADD(S,(next_run_time/10000)*60*60 /* hours */ 
+			  +((next_run_time - (next_run_time/10000) * 10000)/100) * 60 /* mins */ 
+			  + (next_run_time - (next_run_time/100) * 100)  /* secs */, 
+			  CONVERT(DATETIME,RTRIM(next_run_date),112)),100) END AS [START_TIME]
+			  ,SP.program_name [PROGRAM_NAME_SYSPROCESS],EXECREQ.cpu_time [CPU_USAGE]
+			  INTO #TEMP_JOBS
+			FROM     #RunningJobs JSR 
+			JOIN     msdb.dbo.sysjobs SJ
+			ON       JSR.Job_ID=SJ.job_id 
+			JOIN     MSDB..syscategories SG
+            ON		 SJ.category_id=SG.category_id -- GETTING JOB CATEGORIES 					  
+			--\\GETTING CPU FROM SYSPROCESSES
+			JOIN
+			SYS.SYSPROCESSES SP	
+			ON
+			SJ.name=SP.program_name
+			JOIN
+			SYS.DM_EXEC_REQUESTS EXECREQ
+			ON
+			SP.spid=EXECREQ.session_id
+			WHERE    Running=1 -- i.e. still running 
+			AND
+			SG.category_id=10 -- REPL-DISTRIBUTION
+			ORDER BY SJ.name,next_run_date,next_run_time 
+
+DECLARE @RUNNING_AGENT_COUNT INT
+
+   	        SET @RUNNING_AGENT_COUNT= (SELECT COUNT(*) FROM #TEMP_JOBS)
+				IF @RUNNING_AGENT_COUNT >=100
+				    BEGIN
+						SELECT * FROM #TEMP_JOBS
+						SELECT 'TOO MANY DISTRIBUTION AGENT RUNNING' AS 'CURRENT STATUS'
+										DECLARE @ts BIGINT;
+										DECLARE @lastNmin TINYINT;
+										SET @lastNmin = 10;
+										SELECT @ts =(SELECT cpu_ticks/(cpu_ticks/ms_ticks) FROM sys.dm_os_sys_info); 
+										SELECT TOP(@lastNmin)
+												SQLProcessUtilization AS [SQLServer_CPU_Utilization], 
+												SystemIdle AS [System_Idle_Process], 
+												100 - SystemIdle - SQLProcessUtilization AS [Other_Process_CPU_Utilization], 
+												DATEADD(ms,-1 *(@ts - [timestamp]),GETDATE())AS [Event_Time] 
+										FROM (SELECT record.value('(./Record/@id)[1]','int')AS record_id, 
+										record.value('(./Record/SchedulerMonitorEvent/SystemHealth/SystemIdle)[1]','int')AS [SystemIdle], 
+										record.value('(./Record/SchedulerMonitorEvent/SystemHealth/ProcessUtilization)[1]','int')AS [SQLProcessUtilization], 
+										[timestamp]      
+										FROM (SELECT[timestamp], convert(xml, record) AS [record]             
+										FROM sys.dm_os_ring_buffers             
+										WHERE ring_buffer_type =N'RING_BUFFER_SCHEDULER_MONITOR'AND record LIKE'%%')AS x )AS y 
+										ORDER BY record_id DESC; 
+								END
+				ELSE
+				BEGIN
+				SELECT 'NO OF DISTRIBUTION AGENT JOBS ARE LESS THEN 100 IN EXEC REQUESTS' AS 'CURRENT STATUS'
+				END
+
+			END
+
+GO
+
+
